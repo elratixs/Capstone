@@ -1,0 +1,18 @@
+﻿import type { RequestHandler } from "express";
+
+export const denyPatientWrite: RequestHandler =
+  (request, response, next) => {
+    const auth = request.context.auth;
+
+    if (!auth || auth.roles.includes("Paciente")) {
+      response.status(403).json({
+        error: {
+          code: "FORBIDDEN",
+          message: "Los pacientes no pueden modificar ni eliminar informacion clinica."
+        }
+      });
+      return;
+    }
+
+    next();
+  };

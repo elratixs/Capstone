@@ -1,0 +1,44 @@
+﻿services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: wellq-test-postgres
+    environment:
+      POSTGRES_DB: wellq
+      POSTGRES_USER: wellq
+      POSTGRES_PASSWORD: wellq_test_local
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - wellq_test_postgres_data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wellq -d wellq"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: wellq-test-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: wellqtest
+      MINIO_ROOT_PASSWORD: wellq_test_secret_2026
+    ports:
+      - "127.0.0.1:9002:9000"
+      - "127.0.0.1:9003:9001"
+    volumes:
+      - wellq_test_minio_data:/data
+
+  clamav:
+    image: clamav/clamav:stable
+    container_name: wellq-test-clamav
+    ports:
+      - "127.0.0.1:3311:3310"
+    volumes:
+      - wellq_test_clamav_data:/var/lib/clamav
+
+volumes:
+  wellq_test_postgres_data:
+  wellq_test_minio_data:
+  wellq_test_clamav_data:

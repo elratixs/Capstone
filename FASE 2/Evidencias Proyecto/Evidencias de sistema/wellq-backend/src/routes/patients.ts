@@ -1,0 +1,195 @@
+import { Router } from "express";
+import { DatabaseError } from "pg";
+import { z } from "zod";
+import { recordAudit } from "../audit/audit.service.js";
+import { authenticate, requirePermission } from "../middleware/authenticate.js";
+import {
+  createPatient,
+  deletePatient,
+  getPatient,
+  listPatients,
+  updatePatient
+} from "../patients/patient.service.js";
+
+const patientIdSchema = z.string().uuid();
+const patientSchema = z.object({
+  identifier: z.string().trim().min(3).max(80),
+  name: z.string().trim().min(2).max(180),
+  birthDate: z.string().date().nullable().optional(),
+  email: z.string().trim().email().max(255).nullable().optional(),
+  phone: z.string().trim().min(6).max(40).nullable().optional()
+});
+const patientUpdateSchema = patientSchema.partial().refine(
+  (value) => Object.keys(value).length > 0,
+  "Debes enviar al menos un campo."
+);
+const listQuerySchema = z.object({
+  search: z.string().trim().max(120).optional(),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20)
+});
+
+export const patientsRouter = Router();
+patientsRouter.use(authenticate);
+
+patientsRouter.get("/", requirePermission("patients:read"), async (request, response, next) => {
+  const auth = request.context.auth!;
+
+  if (!auth.roles.includes("Administrador")) {
+    response.status(403).json({
+      error: {
+        code: "FORBIDDEN",
+        message: "No tiene autorizacion para listar pacientes."
+      }
+    });
+    return;
+  }
+  const parsed = listQuerySchema.safeParse(request.query);
+  if (!parsed.success) {
+    response.status(400).json({ error: { code: "INVALID_QUERY", message: "Filtros invÃƒÂ¡lidos." } });
+    return;
+  }
+
+  try {
+    const result = await listPatients(
+      request.context.auth!.clientId,
+      parsed.data.search,
+      parsed.data.page,
+      parsed.data.pageSize
+    );
+    response.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+patientsRouter.get("/:id", requirePermission("patients:read"), async (request, response, next) => {
+  const parsedId = patientIdSchema.safeParse(request.params.id);
+  if (!parsedId.success) {
+    response.status(400).json({ error: { code: "INVALID_ID", message: "Paciente invÃƒÂ¡lido." } });
+    return;
+  }
+
+  const auth = request.context.auth!;
+
+  if (auth.roles.includes("Paciente")) {
+    if (!auth.patientId || auth.patientId !== parsedId.data) {
+      response.status(404).json({
+        error: {
+          code: "PATIENT_NOT_FOUND",
+          message: "Paciente no encontrado."
+        }
+      });
+      return;
+    }
+  } else if (!auth.roles.includes("Administrador")) {
+    response.status(403).json({
+      error: {
+        code: "FORBIDDEN",
+        message: "No tiene autorizacion para consultar este paciente."
+      }
+    });
+    return;
+  }
+
+  try {
+    const patient = await getPatient(auth.clientId, parsedId.data);
+    if (!patient) {
+      response.status(404).json({ error: { code: "PATIENT_NOT_FOUND", message: "Paciente no encontrado." } });
+      return;
+    }
+    await recordAudit(request, {
+      action: "patients.read",
+      resourceType: "patient",
+      resourceId: patient.id,
+      statusCode: 200,
+      success: true
+    });
+    response.json({ patient });
+  } catch (error) {
+    next(error);
+  }
+});
+
+patientsRouter.post("/", requirePermission("patients:write"), async (request, response, next) => {
+  const parsed = patientSchema.safeParse(request.body);
+  if (!parsed.success) {
+    response.status(400).json({
+      error: { code: "INVALID_INPUT", message: "Datos del paciente invÃƒÂ¡lidos.", details: parsed.error.flatten().fieldErrors }
+    });
+    return;
+  }
+
+  try {
+    const patient = await createPatient(request.context.auth!.clientId, parsed.data);
+    await recordAudit(request, {
+      action: "patients.create",
+      resourceType: "patient",
+      resourceId: patient.id,
+      statusCode: 201,
+      success: true
+    });
+    response.status(201).json({ patient });
+  } catch (error) {
+    if (error instanceof DatabaseError && error.code === "23505") {
+      response.status(409).json({
+        error: { code: "PATIENT_ALREADY_EXISTS", message: "Ya existe un paciente con ese identificador." }
+      });
+      return;
+    }
+    next(error);
+  }
+});
+
+patientsRouter.patch("/:id", requirePermission("patients:write"), async (request, response, next) => {
+  const parsedId = patientIdSchema.safeParse(request.params.id);
+  const parsedBody = patientUpdateSchema.safeParse(request.body);
+  if (!parsedId.success || !parsedBody.success) {
+    response.status(400).json({ error: { code: "INVALID_INPUT", message: "Datos del paciente invÃƒÂ¡lidos." } });
+    return;
+  }
+
+  try {
+    const patient = await updatePatient(request.context.auth!.clientId, parsedId.data, parsedBody.data);
+    if (!patient) {
+      response.status(404).json({ error: { code: "PATIENT_NOT_FOUND", message: "Paciente no encontrado." } });
+      return;
+    }
+    await recordAudit(request, {
+      action: "patients.update",
+      resourceType: "patient",
+      resourceId: patient.id,
+      statusCode: 200,
+      success: true
+    });
+    response.json({ patient });
+  } catch (error) {
+    next(error);
+  }
+});
+
+patientsRouter.delete("/:id", requirePermission("patients:write"), async (request, response, next) => {
+  const parsedId = patientIdSchema.safeParse(request.params.id);
+  if (!parsedId.success) {
+    response.status(400).json({ error: { code: "INVALID_ID", message: "Paciente invÃƒÂ¡lido." } });
+    return;
+  }
+
+  try {
+    const deleted = await deletePatient(request.context.auth!.clientId, parsedId.data);
+    if (!deleted) {
+      response.status(404).json({ error: { code: "PATIENT_NOT_FOUND", message: "Paciente no encontrado." } });
+      return;
+    }
+    await recordAudit(request, {
+      action: "patients.delete",
+      resourceType: "patient",
+      resourceId: parsedId.data,
+      statusCode: 204,
+      success: true
+    });
+    response.status(204).send();
+  } catch (error) {
+    next(error);
+  }
+});

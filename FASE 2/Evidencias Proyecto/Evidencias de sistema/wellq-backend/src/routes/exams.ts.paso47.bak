@@ -1,0 +1,425 @@
+﻿import { Router } from "express";
+import multer from "multer";
+import { z } from "zod";
+import { recordAudit } from "../audit/audit.service.js";
+import { env } from "../config/env.js";
+import {
+  createExam,
+  deleteExamFileRecord,
+  getExam,
+  getExamFile,
+  getExamFileById,
+  listExamFiles,
+  listExams,
+  listExamTypes,
+  saveExamFile,
+  softDeleteExam,
+  updateExam
+} from "../exams/exam.service.js";
+import { deleteStoredFile, getStoredFile, storeExamFile } from "../exams/file-storage.service.js";
+import { authenticate, requirePermission } from "../middleware/authenticate.js";
+import { authorizeExamAccess } from "../middleware/authorizeExamAccess.js";
+import { database } from "../database/pool.js";
+
+const allowedMimeTypes = new Set(["application/pdf", "image/jpeg", "image/png"]);
+function hasValidFileSignature(buffer: Buffer, mimeType: string): boolean {
+  if (mimeType === "application/pdf") return buffer.subarray(0, 5).toString("ascii") === "%PDF-";
+  if (mimeType === "image/png") return buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  if (mimeType === "image/jpeg") return buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  return false;
+}
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: env.MAX_EXAM_FILE_MB * 1024 * 1024, files: 1 },
+  fileFilter: (_request, file, callback) => {
+    if (allowedMimeTypes.has(file.mimetype)) callback(null, true);
+    else callback(new Error("UNSUPPORTED_FILE_TYPE"));
+  }
+});
+
+const idSchema = z.string().uuid();
+const createSchema = z.object({
+  patientId: z.string().uuid(),
+  examTypeId: z.string().uuid(),
+  name: z.string().trim().min(3).max(180),
+  examDate: z.string().date(),
+  notes: z.string().trim().max(3000).nullable().optional()
+});
+const querySchema = z.object({
+  patientId: z.string().uuid().optional(),
+  search: z.string().trim().max(120).optional(),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20)
+});
+const clinicalEntriesSchema = z.object({
+  entries: z.array(z.object({
+    markerCode: z.string().trim().min(1).max(80),
+    markerName: z.string().trim().min(1).max(120),
+    rawValue: z.string().trim().min(1).max(100),
+    rawUnit: z.string().trim().max(40).nullable().optional(),
+    referenceRange: z.string().trim().max(120).nullable().optional(),
+    page: z.number().int().positive().max(1000).nullable().optional()
+  }).strict()).max(100)
+}).strict();
+
+export const examsRouter = Router();
+examsRouter.use(authenticate);
+
+examsRouter.get("/types", requirePermission("exams:read"), async (request, response, next) => {
+  try {
+    response.json({ items: await listExamTypes(request.context.auth!.clientId) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+examsRouter.get("/", requirePermission("exams:read"), async (request, response, next) => {
+  const parsed = querySchema.safeParse(request.query);
+  if (!parsed.success) {
+    response.status(400).json({ error: { code: "INVALID_QUERY", message: "Filtros invÃ¡lidos." } });
+    return;
+  }
+  try {
+    const auth = request.context.auth!;
+
+    if (auth.roles.includes("Paciente")) {
+      if (!auth.patientId) {
+        response.status(403).json({
+          error: {
+            code: "PATIENT_NOT_LINKED",
+            message: "Usuario sin paciente asociado."
+          }
+        });
+        return;
+      }
+
+      response.json(await listExams(auth.clientId, {
+        ...parsed.data,
+        patientId: auth.patientId
+      }));
+      return;
+    }
+
+    if (!auth.roles.includes("Administrador")) {
+      response.status(403).json({
+        error: {
+          code: "FORBIDDEN",
+          message: "No tiene acceso al listado de examenes."
+        }
+      });
+      return;
+    }
+
+    response.json(await listExams(auth.clientId, parsed.data));
+  } catch (error) {
+    next(error);
+  }
+});
+
+examsRouter.post("/", requirePermission("exams:write"), async (request, response, next) => {
+  const parsed = createSchema.safeParse(request.body);
+  if (!parsed.success) {
+    response.status(400).json({ error: { code: "INVALID_INPUT", message: "Datos del examen invÃ¡lidos.", details: parsed.error.flatten().fieldErrors } });
+    return;
+  }
+  try {
+    const exam = await createExam(request.context.auth!.clientId, request.context.auth!.userId, parsed.data);
+    if (!exam) {
+      response.status(422).json({ error: { code: "INVALID_RELATION", message: "Paciente o tipo de examen invÃ¡lido." } });
+      return;
+    }
+    await recordAudit(request, { action: "exams.create", resourceType: "exam", resourceId: exam.id, statusCode: 201, success: true });
+    response.status(201).json({ exam });
+  } catch (error) {
+    next(error);
+  }
+});
+
+examsRouter.get("/:id", requirePermission("exams:read"), authorizeExamAccess, async (request, response, next) => {
+  const id = idSchema.safeParse(request.params.id);
+  if (!id.success) {
+    response.status(400).json({ error: { code: "INVALID_ID", message: "Examen invÃ¡lido." } });
+    return;
+  }
+  try {
+    const exam = await getExam(request.context.auth!.clientId, id.data);
+    if (!exam) {
+      response.status(404).json({ error: { code: "EXAM_NOT_FOUND", message: "Examen no encontrado." } });
+      return;
+    }
+    await recordAudit(request, { action: "VIEW_EXAM", resourceType: "exam", resourceId: exam.id, statusCode: 200, success: true });
+    response.json({ exam });
+  } catch (error) {
+    next(error);
+  }
+});
+
+examsRouter.post("/:id/file", requirePermission("exams:upload"), authorizeExamAccess, upload.single("file"), async (request, response, next) => {
+  const id = idSchema.safeParse(request.params.id);
+  if (!id.success || !request.file || !hasValidFileSignature(request.file.buffer, request.file.mimetype)) {
+    response.status(400).json({ error: { code: "INVALID_FILE", message: "Debes adjuntar un archivo PDF, JPG o PNG." } });
+    return;
+  }
+
+  let storedObjectKey: string | undefined;
+  try {
+
+    const stored = await storeExamFile(request.context.auth!.clientId, id.data, request.file);
+    storedObjectKey = stored.objectKey;
+    const examFile = await saveExamFile({
+      examId: id.data,
+      clientId: request.context.auth!.clientId,
+      uploadedBy: request.context.auth!.userId,
+      objectKey: stored.objectKey,
+      originalName: request.file.originalname,
+      mimeType: request.file.mimetype,
+      sizeBytes: request.file.size,
+      sha256: stored.sha256
+    });
+    if (!examFile) {
+      await deleteStoredFile(stored.objectKey);
+      response.status(404).json({ error: { code: "EXAM_NOT_FOUND", message: "Examen no encontrado." } });
+      return;
+    }
+    await recordAudit(request, { action: "UPLOAD_EXAM", resourceType: "exam", resourceId: id.data, statusCode: 201, success: true });
+    response.status(201).json({ file: examFile });
+  } catch (error) {
+    if (storedObjectKey) await deleteStoredFile(storedObjectKey).catch(() => undefined);
+    next(error);
+  }
+});
+
+async function sendExamFile(request: Parameters<Parameters<typeof examsRouter.get>[1]>[0], response: Parameters<Parameters<typeof examsRouter.get>[1]>[1], next: (error?: unknown) => void, download: boolean) {
+  const id = idSchema.safeParse(request.params.id);
+  if (!id.success) {
+    response.status(400).json({ error: { code: "INVALID_ID", message: "Examen invÃ¡lido." } });
+    return;
+  }
+  try {
+    const file = await getExamFile(request.context.auth!.clientId, id.data);
+    if (!file) {
+      response.status(404).json({ error: { code: "FILE_NOT_FOUND", message: "Archivo no encontrado." } });
+      return;
+    }
+    const contents = await getStoredFile(file.objectKey);
+    response.type(file.mimeType);
+    if (download) response.attachment(file.originalName);
+    else response.setHeader("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(file.originalName)}`);
+    await recordAudit(request, { action: download ? "DOWNLOAD_EXAM" : "VIEW_EXAM", resourceType: "exam", resourceId: id.data, statusCode: 200, success: true });
+    response.send(contents);
+  } catch (error) {
+    next(error);
+  }
+}
+
+examsRouter.get("/:id/file", requirePermission("exams:read"), authorizeExamAccess, (request, response, next) => void sendExamFile(request, response, next, false));
+examsRouter.get("/:id/file/download", requirePermission("exams:download"), authorizeExamAccess, (request, response, next) => void sendExamFile(request, response, next, true));
+
+examsRouter.get("/:id/files", requirePermission("exams:read"), authorizeExamAccess, async (request, response, next) => {
+  const id = idSchema.safeParse(request.params.id);
+  if (!id.success) {
+    response.status(400).json({ error: { code: "INVALID_ID", message: "Examen inválido." } });
+    return;
+  }
+
+  try {
+    const clientId = request.context.auth!.clientId;
+    const exam = await getExam(clientId, id.data);
+
+    if (!exam) {
+      response.status(404).json({ error: { code: "EXAM_NOT_FOUND", message: "Examen no encontrado." } });
+      return;
+    }
+
+    const files = await listExamFiles(clientId, id.data);
+    await recordAudit(request, {
+      action: "exams.files.list",
+      resourceType: "exam",
+      resourceId: id.data,
+      statusCode: 200,
+      success: true
+    });
+
+    response.json({
+      items: files.map(({ objectKey, sha256, ...file }) => file)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+async function sendExamFileById(
+  request: Parameters<Parameters<typeof examsRouter.get>[1]>[0],
+  response: Parameters<Parameters<typeof examsRouter.get>[1]>[1],
+  next: (error?: unknown) => void,
+  download: boolean
+) {
+  const id = idSchema.safeParse(request.params.id);
+  const fileId = idSchema.safeParse(request.params.fileId);
+
+  if (!id.success || !fileId.success) {
+    response.status(400).json({ error: { code: "INVALID_ID", message: "Identificador inválido." } });
+    return;
+  }
+
+  try {
+    const file = await getExamFileById(
+      request.context.auth!.clientId,
+      id.data,
+      fileId.data
+    );
+
+    if (!file) {
+      response.status(404).json({ error: { code: "FILE_NOT_FOUND", message: "Archivo no encontrado." } });
+      return;
+    }
+
+    const contents = await getStoredFile(file.objectKey);
+
+    response.type(file.mimeType);
+    response.setHeader("Cache-Control", "no-store");
+
+    if (download) {
+      response.attachment(file.originalName);
+    } else {
+      response.setHeader(
+        "Content-Disposition",
+        `inline; filename*=UTF-8''${encodeURIComponent(file.originalName)}`
+      );
+    }
+
+    await recordAudit(request, {
+      action: download ? "DOWNLOAD_EXAM" : "VIEW_EXAM",
+      resourceType: "exam",
+      resourceId: id.data,
+      statusCode: 200,
+      success: true,
+      metadata: { fileId: file.id }
+    });
+
+    response.send(contents);
+  } catch (error) {
+    next(error);
+  }
+}
+
+examsRouter.get(
+  "/:id/files/:fileId",
+  requirePermission("exams:read"), authorizeExamAccess,
+  (request, response, next) =>
+    void sendExamFileById(request, response, next, false)
+);
+
+examsRouter.get(
+  "/:id/files/:fileId/download",
+  requirePermission("exams:download"), authorizeExamAccess,
+  (request, response, next) =>
+    void sendExamFileById(request, response, next, true)
+);
+examsRouter.put("/:id", requirePermission("exams:write"), async (request, response, next) => {
+  const id = idSchema.safeParse(request.params.id);
+  const parsed = createSchema.safeParse(request.body);
+  if (!id.success || !parsed.success) {
+    response.status(400).json({ error: { code: "INVALID_INPUT", message: "Datos del examen invÃ¡lidos." } });
+    return;
+  }
+  try {
+    const exam = await updateExam(request.context.auth!.clientId, id.data, parsed.data);
+    if (!exam) {
+      response.status(404).json({ error: { code: "EXAM_NOT_FOUND", message: "Examen o relaciones no encontradas en esta clÃ­nica." } });
+      return;
+    }
+    await recordAudit(request, { action: "UPDATE_EXAM", resourceType: "exam", resourceId: exam.id, statusCode: 200, success: true });
+    response.json({ exam });
+  } catch (error) {
+    next(error);
+  }
+});
+
+examsRouter.delete("/:id", requirePermission("exams:write"), async (request, response, next) => {
+  const id = idSchema.safeParse(request.params.id);
+  if (!id.success) {
+    response.status(400).json({ error: { code: "INVALID_ID", message: "Examen invÃ¡lido." } });
+    return;
+  }
+  try {
+    const clientId = request.context.auth!.clientId;
+    const exam = await getExam(clientId, id.data);
+    if (!exam) {
+      response.status(404).json({ error: { code: "EXAM_NOT_FOUND", message: "Examen no encontrado." } });
+      return;
+    }
+    // Conservamos los documentos clínicos para mantener su trazabilidad.
+    // El examen se elimina lógicamente, sin borrar archivos de MinIO.
+    await softDeleteExam(clientId, id.data);
+    await recordAudit(request, { action: "DELETE_EXAM", resourceType: "exam", resourceId: id.data, statusCode: 204, success: true });
+    response.status(204).send();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Manual transcription is stored as a proposal. It cannot be used for scoring
+// until a patient confirmation and a separate clinical validation exist.
+examsRouter.get("/:id/results", requirePermission("exams:read"), authorizeExamAccess, async (request, response, next) => {
+  const id = idSchema.safeParse(request.params.id);
+  if (!id.success) {
+    response.status(400).json({ error: { code: "INVALID_ID", message: "Examen invÃ¡lido." } });
+    return;
+  }
+  try {
+    const clientId = request.context.auth!.clientId;
+    const exam = await getExam(clientId, id.data);
+    if (!exam) {
+      response.status(404).json({ error: { code: "EXAM_NOT_FOUND", message: "Examen no encontrado." } });
+      return;
+    }
+    const result = await database.query(
+      `SELECT entries, status, patient_confirmed_at, validated_at, updated_at
+         FROM clinical_result_records WHERE client_id = $1 AND exam_id = $2`,
+      [clientId, id.data]
+    );
+    await recordAudit(request, { action: "clinical_results.read", resourceType: "exam", resourceId: id.data, statusCode: 200, success: true });
+    response.json({ results: result.rows[0] ?? { entries: [], status: "not_started", patient_confirmed_at: null, validated_at: null } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+examsRouter.put("/:id/results", requirePermission("exams:write"), async (request, response, next) => {
+  const id = idSchema.safeParse(request.params.id);
+  const body = clinicalEntriesSchema.safeParse(request.body);
+  if (!id.success || !body.success) {
+    response.status(400).json({ error: { code: "INVALID_RESULTS", message: "Revisa los datos transcritos." } });
+    return;
+  }
+  try {
+    const auth = request.context.auth!;
+    const exam = await getExam(auth.clientId, id.data);
+    if (!exam) {
+      response.status(404).json({ error: { code: "EXAM_NOT_FOUND", message: "Examen no encontrado." } });
+      return;
+    }
+    const saved = await database.query(
+      `INSERT INTO clinical_result_records (client_id, exam_id, entries, status, created_by, updated_by)
+       VALUES ($1, $2, $3::jsonb, 'awaiting_patient_confirmation', $4, $4)
+       ON CONFLICT (client_id, exam_id) DO UPDATE
+         SET entries = EXCLUDED.entries, status = 'awaiting_patient_confirmation',
+             patient_confirmed_by = NULL, patient_confirmed_at = NULL,
+             validated_by = NULL, validated_at = NULL,
+             updated_by = EXCLUDED.updated_by, updated_at = now()
+       RETURNING entries, status, patient_confirmed_at, validated_at, updated_at`,
+      [auth.clientId, id.data, JSON.stringify(body.data.entries), auth.userId]
+    );
+    await recordAudit(request, { action: "clinical_results.transcription.save", resourceType: "exam", resourceId: id.data, statusCode: 200, success: true, metadata: { entryCount: body.data.entries.length } });
+    response.json({ results: saved.rows[0] });
+  } catch (error) {
+    next(error);
+  }
+});
+
+
+
+
+
+

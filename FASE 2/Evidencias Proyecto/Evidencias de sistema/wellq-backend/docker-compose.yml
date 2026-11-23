@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: wellq-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wellq
+      POSTGRES_USER: wellq
+      POSTGRES_PASSWORD: wellq_local
+    ports:
+      - "5432:5432"
+    volumes:
+      - wellq_postgres_data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wellq -d wellq"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  clamav:
+    image: clamav/clamav:stable
+    container_name: wellq-clamav
+    restart: unless-stopped
+    ports:
+      - "3310:3310"
+    volumes:
+      - wellq_clamav_data:/var/lib/clamav
+
+  minio-permissions:
+    image: alpine:3.20
+    container_name: wellq-minio-permissions
+    user: "0:0"
+    restart: "no"
+    command: ["sh", "-c", "chown -R 65532:65532 /data"]
+    volumes:
+      - wellq_minio_data:/data
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: wellq-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: wellq
+      MINIO_ROOT_PASSWORD: wellq_local_secret
+    depends_on:
+      minio-permissions:
+        condition: service_completed_successfully
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - wellq_minio_data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: wellq-minio-init
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command: "until mc alias set local http://minio:9000 wellq wellq_local_secret; do sleep 1; done; mc mb --ignore-existing local/wellq-exams"
+
+volumes:
+  wellq_postgres_data:
+  wellq_minio_data:
+  wellq_clamav_data:
+
+

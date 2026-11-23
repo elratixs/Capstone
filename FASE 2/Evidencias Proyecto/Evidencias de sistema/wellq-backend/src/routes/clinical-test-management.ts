@@ -1,0 +1,149 @@
+import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { Router, type Request, type Response } from "express";
+import { createHash } from "node:crypto";
+import { z } from "zod";
+import { recordAudit } from "../audit/audit.service.js";
+import { env } from "../config/env.js";
+import { database } from "../database/pool.js";
+import { authenticate } from "../middleware/authenticate.js";
+
+const router = Router();
+router.use(authenticate);
+const s3 = new S3Client({ endpoint: env.S3_ENDPOINT, region: env.S3_REGION, forcePathStyle: env.S3_FORCE_PATH_STYLE, credentials: { accessKeyId: env.S3_ACCESS_KEY, secretAccessKey: env.S3_SECRET_KEY } });
+const uuid = z.string().uuid();
+const patientRoles = ["patient", "Paciente"];
+const clinicianRoles = ["clinician", "Clinico", "Clínico", "Profesional"];
+
+function identity(request: Request, response: Response, kind: "patient" | "clinician") {
+  const auth = request.context.auth;
+  if (!auth) { response.status(401).json({ error: { code: "UNAUTHORIZED", message: "Inicia sesión para continuar." } }); return null; }
+  if (kind === "patient" && (!auth.patientId || !auth.roles.some((role) => patientRoles.includes(role)))) {
+    response.status(403).json({ error: { code: "FORBIDDEN", message: "La cuenta no tiene acceso de paciente vinculado." } }); return null;
+  }
+  if (kind === "clinician" && !auth.roles.some((role) => clinicianRoles.includes(role))) {
+    response.status(403).json({ error: { code: "FORBIDDEN", message: "Se requiere un perfil clínico." } }); return null;
+  }
+  return auth;
+}
+
+async function clinicianCanAccess(clientId: string, patientId: string, userId: string): Promise<boolean> {
+  const result = await database.query("SELECT 1 FROM patient_clinician_access WHERE client_id=$1 AND patient_id=$2 AND clinician_user_id=$3", [clientId, patientId, userId]);
+  return Boolean(result.rowCount);
+}
+
+router.get("/", async (request, response, next) => {
+  const auth = identity(request, response, "patient"); if (!auth) return;
+  const query = z.object({ status: z.string().optional(), test_type: z.string().optional(), limit: z.coerce.number().int().min(1).max(100).default(20), cursor: z.string().optional() }).safeParse(request.query);
+  if (!query.success) { response.status(400).json({ error: { code: "INVALID_QUERY", message: "Filtros inválidos." } }); return; }
+  try {
+    let timestamp: string | null = null; let lastId: string | null = null;
+    if (query.data.cursor) {
+      try { const parts = Buffer.from(query.data.cursor, "base64url").toString().split("|"); if (parts.length !== 2 || !uuid.safeParse(parts[1]).success || Number.isNaN(Date.parse(parts[0]))) throw new Error(); [timestamp, lastId] = parts; }
+      catch { response.status(400).json({ error: { code: "INVALID_CURSOR", message: "Cursor inválido." } }); return; }
+    }
+    const result = await database.query<any>(`SELECT id AS clinical_test_id,title,test_type,test_date,file_name,status,review_status,reviewed_at,created_at FROM clinical_tests WHERE client_id=$1 AND patient_id=$2 AND deleted_at IS NULL AND ($3::text IS NULL OR status=$3) AND ($4::text IS NULL OR test_type=$4) AND ($5::timestamptz IS NULL OR (created_at,id)<($5::timestamptz,$6::uuid)) ORDER BY created_at DESC,id DESC LIMIT $7`, [auth.clientId, auth.patientId, query.data.status ?? null, query.data.test_type ?? null, timestamp, lastId, query.data.limit + 1]);
+    const more = result.rows.length > query.data.limit; const items = result.rows.slice(0, query.data.limit); const last = items.at(-1);
+    response.json({ items, next_cursor: more && last ? Buffer.from(`${new Date(last.created_at).toISOString()}|${last.clinical_test_id}`).toString("base64url") : null });
+  } catch (error) { next(error); }
+});
+
+router.get("/patients/:patientId/clinical-tests", async (request, response, next) => {
+  const auth = identity(request, response, "clinician"); if (!auth) return;
+  if (!uuid.safeParse(request.params.patientId).success) { response.status(400).json({ error: { code: "INVALID_ID", message: "Paciente inválido." } }); return; }
+  try {
+    if (!(await clinicianCanAccess(auth.clientId, request.params.patientId, auth.userId))) { response.status(403).json({ error: { code: "FORBIDDEN", message: "No tienes acceso clínico a este paciente." } }); return; }
+    const result = await database.query<any>(`SELECT id AS clinical_test_id,title,test_type,test_date,status,review_status,reviewed_at,created_at FROM clinical_tests WHERE client_id=$1 AND patient_id=$2 AND deleted_at IS NULL ORDER BY test_date DESC,created_at DESC LIMIT 100`, [auth.clientId, request.params.patientId]);
+    response.json({ items: result.rows, next_cursor: null });
+  } catch (error) { next(error); }
+});
+
+router.get("/:clinicalTestId", async (request, response, next) => {
+  const auth = request.context.auth;
+  if (!auth) { response.status(401).json({ error: { code: "UNAUTHORIZED", message: "Inicia sesión para continuar." } }); return; }
+  const isPatient = Boolean(auth.patientId && auth.roles.some((role) => patientRoles.includes(role)));
+  const isClinician = auth.roles.some((role) => clinicianRoles.includes(role));
+  if (!isPatient && !isClinician) { response.status(403).json({ error: { code: "FORBIDDEN", message: "Perfil sin acceso a resultados clínicos." } }); return; }
+  if (!uuid.safeParse(request.params.clinicalTestId).success) { response.status(400).json({ error: { code: "INVALID_ID", message: "Examen inválido." } }); return; }
+  try {
+    const result = await database.query<any>(`SELECT id AS clinical_test_id,patient_id,title,test_type,test_date,notes,file_name,mime_type,size_bytes,status,review_status,reviewed_at,created_at,updated_at FROM clinical_tests WHERE client_id=$1 AND id=$2 AND deleted_at IS NULL`, [auth.clientId, request.params.clinicalTestId]);
+    const test = result.rows[0];
+    if (!test) { response.status(404).json({ error: { code: "NOT_FOUND", message: "Resultado no encontrado." } }); return; }
+    if (isPatient && test.patient_id !== auth.patientId) { response.status(403).json({ error: { code: "FORBIDDEN", message: "No autorizado." } }); return; }
+    if (isClinician && !(await clinicianCanAccess(auth.clientId, test.patient_id, auth.userId))) { response.status(403).json({ error: { code: "FORBIDDEN", message: "No tienes acceso clínico a este paciente." } }); return; }
+    await recordAudit(request, { action: "CLINICAL_TEST_VIEW", resourceType: "clinical_test", resourceId: request.params.clinicalTestId, statusCode: 200, success: true });
+    if (isPatient) { const { patient_id: _patientId, ...patientView } = test; response.json(patientView); }
+    else response.json(test);
+  } catch (error) { next(error); }
+});
+
+router.patch("/:clinicalTestId", async (request, response, next) => {
+  const auth = identity(request, response, "patient"); if (!auth) return;
+  if (!uuid.safeParse(request.params.clinicalTestId).success) { response.status(400).json({ error: { code: "INVALID_ID", message: "Examen inválido." } }); return; }
+  const patch = z.object({ title: z.string().trim().min(1).max(200).optional(), test_type: z.string().trim().min(1).max(80).optional(), test_date: z.string().date().optional(), notes: z.string().trim().max(2000).nullable().optional() }).strict().refine((value) => Object.keys(value).length > 0).safeParse(request.body);
+  if (!patch.success) { response.status(400).json({ error: { code: "INVALID_METADATA", message: "Metadatos inválidos." } }); return; }
+  try {
+    const before = await database.query<any>(`SELECT title,test_type,test_date,notes,review_status FROM clinical_tests WHERE client_id=$1 AND patient_id=$2 AND id=$3 AND deleted_at IS NULL`, [auth.clientId, auth.patientId, request.params.clinicalTestId]);
+    if (!before.rows[0]) { response.status(404).json({ error: { code: "NOT_FOUND", message: "Resultado no encontrado." } }); return; }
+    if (before.rows[0].review_status !== "not_reviewed") { response.status(409).json({ error: { code: "ALREADY_REVIEWED", message: "No puedes editar un resultado ya revisado." } }); return; }
+    const v = patch.data;
+    const updated = await database.query<any>(`UPDATE clinical_tests SET title=COALESCE($1,title),test_type=COALESCE($2,test_type),test_date=COALESCE($3::date,test_date),notes=CASE WHEN $4::boolean THEN $5 ELSE notes END,updated_at=now() WHERE client_id=$6 AND patient_id=$7 AND id=$8 AND review_status='not_reviewed' RETURNING id AS clinical_test_id,updated_at`, [v.title ?? null,v.test_type ?? null,v.test_date ?? null,Object.hasOwn(v,"notes"),v.notes ?? null,auth.clientId,auth.patientId,request.params.clinicalTestId]);
+    if (!updated.rows[0]) { response.status(409).json({ error: { code: "ALREADY_REVIEWED", message: "No puedes editar un resultado ya revisado." } }); return; }
+    const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    await recordAudit(request, { action: "CLINICAL_TEST_METADATA_UPDATE", resourceType: "clinical_test", resourceId: request.params.clinicalTestId, statusCode: 200, success: true, metadata: { changed_fields: Object.keys(v), before_sha256: digest(before.rows[0]), after_sha256: digest({ ...before.rows[0], ...v }) } });
+    response.json(updated.rows[0]);
+  } catch (error) { next(error); }
+});
+
+router.delete("/:clinicalTestId", async (request, response, next) => {
+  const auth = identity(request, response, "patient"); if (!auth) return;
+  if (!uuid.safeParse(request.params.clinicalTestId).success) { response.status(400).json({ error: { code: "INVALID_ID", message: "Examen inválido." } }); return; }
+  try {
+    const result = await database.query(`UPDATE clinical_tests SET status='deleted',deleted_at=now(),updated_at=now() WHERE client_id=$1 AND patient_id=$2 AND id=$3 AND deleted_at IS NULL AND review_status='not_reviewed' RETURNING id`, [auth.clientId,auth.patientId,request.params.clinicalTestId]);
+    if (!result.rowCount) { response.status(404).json({ error: { code: "NOT_FOUND", message: "Resultado no encontrado o no eliminable." } }); return; }
+    await recordAudit(request, { action: "CLINICAL_TEST_DELETE", resourceType: "clinical_test", resourceId: request.params.clinicalTestId, statusCode: 200, success: true });
+    response.json({ clinical_test_id: request.params.clinicalTestId, status: "deleted", deleted_at: new Date().toISOString() });
+  } catch (error) { next(error); }
+});
+
+router.patch("/:clinicalTestId/review", async (request, response, next) => {
+  const auth = identity(request, response, "clinician"); if (!auth) return;
+  if (!uuid.safeParse(request.params.clinicalTestId).success) { response.status(400).json({ error: { code: "INVALID_ID", message: "Examen inválido." } }); return; }
+  const body = z.object({ review_status: z.literal("reviewed"), review_note: z.string().trim().max(2000).nullable().optional() }).strict().safeParse(request.body);
+  if (!body.success) { response.status(400).json({ error: { code: "INVALID_INPUT", message: "Datos de revisión inválidos." } }); return; }
+  try {
+    const selected = await database.query<any>(`SELECT patient_id,status,review_status FROM clinical_tests WHERE client_id=$1 AND id=$2 AND deleted_at IS NULL`, [auth.clientId,request.params.clinicalTestId]);
+    const test = selected.rows[0];
+    if (!test) { response.status(404).json({ error: { code: "NOT_FOUND", message: "Resultado no encontrado." } }); return; }
+    if (!(await clinicianCanAccess(auth.clientId, test.patient_id, auth.userId))) { response.status(403).json({ error: { code: "FORBIDDEN", message: "No tienes acceso clínico a este paciente." } }); return; }
+    if (test.status !== "ready_for_review" || test.review_status !== "not_reviewed") { response.status(409).json({ error: { code: "DOCUMENT_NOT_READY", message: "El resultado no se puede revisar en su estado actual." } }); return; }
+    const updated = await database.query<any>(`UPDATE clinical_tests SET review_status='reviewed',reviewed_at=now(),reviewed_by=$1,review_note=$2,updated_at=now() WHERE client_id=$3 AND id=$4 AND review_status='not_reviewed' RETURNING id AS clinical_test_id,reviewed_at,reviewed_by`, [auth.userId,body.data.review_note ?? null,auth.clientId,request.params.clinicalTestId]);
+    if (!updated.rows[0]) { response.status(409).json({ error: { code: "DOCUMENT_NOT_READY", message: "El resultado ya fue revisado." } }); return; }
+    await recordAudit(request, { action: "CLINICAL_TEST_REVIEW", resourceType: "clinical_test", resourceId: request.params.clinicalTestId, statusCode: 200, success: true, metadata: { prior_status: test.review_status } });
+    response.json({ clinical_test_id: updated.rows[0].clinical_test_id, review: { status: "reviewed", reviewed_at: updated.rows[0].reviewed_at, reviewed_by: updated.rows[0].reviewed_by } });
+  } catch (error) { next(error); }
+});
+
+router.post("/:clinicalTestId/download-url", async (request, response, next) => {
+  const auth = request.context.auth;
+  if (!auth) { response.status(401).json({ error: { code: "UNAUTHORIZED", message: "Inicia sesión para continuar." } }); return; }
+  const isPatient = Boolean(auth.patientId && auth.roles.some((role) => patientRoles.includes(role)));
+  const isClinician = auth.roles.some((role) => clinicianRoles.includes(role));
+  if (!isPatient && !isClinician) { response.status(403).json({ error: { code: "FORBIDDEN", message: "Perfil sin acceso a este resultado." } }); return; }
+  if (!uuid.safeParse(request.params.clinicalTestId).success) { response.status(400).json({ error: { code: "INVALID_ID", message: "Examen inválido." } }); return; }
+  const body = z.object({ disposition: z.enum(["inline","attachment"]).default("attachment") }).safeParse(request.body ?? {});
+  if (!body.success) { response.status(400).json({ error: { code: "INVALID_INPUT", message: "Solicitud de descarga inválida." } }); return; }
+  try {
+    const result = await database.query<any>(`SELECT patient_id,object_key,file_name FROM clinical_tests WHERE client_id=$1 AND id=$2 AND status='ready_for_review' AND deleted_at IS NULL`, [auth.clientId,request.params.clinicalTestId]);
+    const test = result.rows[0];
+    if (!test) { response.status(404).json({ error: { code: "NOT_FOUND", message: "Resultado no disponible." } }); return; }
+    if (isPatient && test.patient_id !== auth.patientId) { response.status(403).json({ error: { code: "FORBIDDEN", message: "No autorizado." } }); return; }
+    if (isClinician && !(await clinicianCanAccess(auth.clientId, test.patient_id, auth.userId))) { response.status(403).json({ error: { code: "FORBIDDEN", message: "No tienes acceso clínico a este paciente." } }); return; }
+    const fileName = String(test.file_name).replace(/[\r\n"\\]/g, "_");
+    const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: test.object_key, ResponseContentDisposition: `${body.data.disposition}; filename="${fileName}"` }), { expiresIn: 300 });
+    await recordAudit(request, { action: "CLINICAL_TEST_DOWNLOAD_URL", resourceType: "clinical_test", resourceId: request.params.clinicalTestId, statusCode: 200, success: true });
+    response.json({ url, expires_at: new Date(Date.now()+300_000).toISOString(), file_name: test.file_name });
+  } catch (error) { next(error); }
+});
+
+export const clinicalTestManagementRouter = router;
